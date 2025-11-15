@@ -1,14 +1,21 @@
+#![allow(unused)]
+
 use std::{
     alloc::Layout,
-    collections::VecDeque,
     marker::PhantomData,
     pin::Pin,
-    sync::atomic::AtomicUsize,
+    sync::{
+        atomic::AtomicUsize,
+        mpsc::{Receiver, Sender, channel},
+    },
     task::{Context, Poll, Waker},
 };
 
+thread_local! {
+    static QUEUE: (Sender<Task>, Receiver<Task>) = channel()
+}
+
 struct LocalExecutor<'a> {
-    queue: VecDeque<Task>,
     // Invariant `'a` lifetime.
     _marker: PhantomData<&'a ()>,
 }
@@ -16,33 +23,28 @@ struct LocalExecutor<'a> {
 impl<'a> LocalExecutor<'a> {
     pub const fn new() -> Self {
         Self {
-            queue: VecDeque::new(),
+            // queue: VecDeque::new(),
             _marker: PhantomData,
         }
     }
 
-    pub fn spawn<F>(&mut self, fut: F)
+    pub fn spawn<F, O>(&mut self, fut: F)
     where
-        F: Future<Output = ()> + 'a,
+        F: Future<Output = O> + 'a,
     {
         let future = Box::pin(fut);
         let raw = RawTask::allocate(future);
-        self.queue.push_back(Task { raw });
-        // let task = Task { raw };
-        // task.poll();
+        let task = Task { raw };
+        QUEUE.with(|(tx, _)| tx.send(task).unwrap());
     }
 
-    fn run(&mut self) {
-        while let Some(task) = self.queue.pop_front() {
-            task.poll();
-            // let waker = Waker::noop();
-            // let mut cx = Context::from_waker(&waker);
-
-            // match fut.poll(&mut cx) {
-            //     Poll::Ready(_) => {}
-            //     Poll::Pending => {}
-            // };
-        }
+    fn run(&self) {
+        QUEUE.with(|(_, rx)| {
+            while let Ok(task) = rx.recv() {
+                task.poll();
+                break;
+            }
+        });
     }
 }
 
@@ -50,10 +52,15 @@ struct Task {
     raw: *const (),
 }
 
+macro_rules! header {
+    ($raw:expr) => {
+        (*($raw as *const Header))
+    };
+}
+
 impl Task {
     fn poll(&self) {
-        // unsafe { ((*(self.raw as *const Header)).vtable.poll)(self.raw) };
-        unsafe { ((*self.raw.cast::<Header>()).vtable.poll)(self.raw) };
+        unsafe { (header!(self.raw).vtable.poll)(self.raw) };
     }
 }
 
@@ -66,68 +73,90 @@ struct Header {
     vtable: &'static RawTaskVTable,
 }
 
-struct RawTask<F> {
-    header: *const Header,
+struct RawTask<F, O> {
+    header: *mut Header,
     future: *mut F,
+    output: *mut O,
 }
 
-impl<F> Copy for RawTask<F> {}
-impl<F> Clone for RawTask<F> {
+impl<F, O> Copy for RawTask<F, O> {}
+impl<F, O> Clone for RawTask<F, O> {
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<F> RawTask<F>
+struct RawTaskOffsets {
+    future: usize,
+    output: usize,
+}
+
+impl<F, O> RawTask<F, O>
 where
-    F: Future<Output = ()>,
+    F: Future<Output = O>,
 {
+    fn compute_layout() -> (Layout, RawTaskOffsets) {
+        let lay_header = Layout::new::<Header>();
+        let lay_f = Layout::new::<F>();
+        let lay_o = Layout::new::<O>();
+
+        let layout = lay_header;
+        let (_, future) = layout.extend(lay_f).unwrap();
+        let (layout, output) = layout.extend(lay_o).unwrap();
+
+        (layout, RawTaskOffsets { future, output })
+    }
+
+    fn arrange(p: *const (), offset: &RawTaskOffsets) -> Self {
+        unsafe {
+            Self {
+                header: p as *mut Header,
+                future: p.byte_add(offset.future) as *mut F,
+                output: p.byte_add(offset.output) as *mut O,
+            }
+        }
+    }
+
     fn allocate(future: F) -> *const () {
         println!("allocate fut");
-        let lay_header = Layout::new::<Header>();
-        let lay_fut = Layout::new::<F>();
-
-        let (layout, offset_fut) = lay_header.extend(lay_fut).unwrap();
-        println!("layout = {layout:?}");
+        let (layout, offset) = Self::compute_layout();
 
         unsafe {
-            let raw = std::alloc::alloc(layout) as *mut Header;
+            let p = std::alloc::alloc(layout) as *const ();
+            let raw = Self::arrange(p, &offset);
 
             println!("write header");
-            raw.write(Header {
+            raw.header.write(Header {
                 state: AtomicUsize::new(0),
                 vtable: &RawTaskVTable { poll: Self::poll },
             });
 
+            raw.future.write(future);
             println!("write future");
-            (raw.byte_add(offset_fut) as *mut F).write(future);
+            // (raw.byte_add(offset.future) as *mut F).write(future);
 
             println!("ret");
-            raw as *const ()
+            p
         }
     }
 
     fn from_ptr(p: *const ()) -> Self {
-        todo!()
-        /* unsafe {
-            Self {
-                future: (*(p as *const Self)).future as *mut F,
-            }
-        } */
+        let (_, offset) = Self::compute_layout();
+        Self::arrange(p, &offset)
     }
 
     fn poll(p: *const ()) {
         println!("polling!");
-        /* let raw = Self::from_ptr(p);
+        let raw = Self::from_ptr(p);
         unsafe {
             let waker = Waker::noop();
             let mut cx = Context::from_waker(&waker);
 
-            match <F as Future>::poll(Pin::new_unchecked(&mut *raw.future), &mut cx) {
+            match F::poll(Pin::new_unchecked(&mut *raw.future), &mut cx) {
                 Poll::Ready(v) => {}
                 Poll::Pending => {}
             }
-        }; */
+        };
     }
 }
 
@@ -136,7 +165,6 @@ pub fn works() {
 
     let mut a = 1;
     let b = &mut a;
-    *b += 1;
 
     exec.spawn(async move {
         let c = b;
@@ -179,6 +207,7 @@ async fn yield_now() {
         type Output = ();
 
         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            println!("yield_now.poll()");
             if !self.0 {
                 self.0 = true;
                 cx.waker().wake_by_ref();
