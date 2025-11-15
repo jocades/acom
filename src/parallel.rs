@@ -87,7 +87,7 @@ impl<'a, R: Send + 'a> Parallel<'a, R> {
         })
     }
 
-    pub fn run_with_timeout(self, timeout: Duration) -> Vec<Option<R>> {
+    pub fn run_timeout(self, timeout: Duration) -> Vec<Option<R>> {
         thread::scope(|s| {
             let (tx, rx) = mpsc::channel();
             let count = self.closures.len();
