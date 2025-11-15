@@ -82,4 +82,58 @@ pub fn into_pin() {
     };
 }
 
-fn main() {}
+struct Task {
+    raw: *const (),
+}
+
+struct RawTask<F, S> {
+    future: *mut F,
+    schedule: *mut S,
+}
+
+struct Schedule<Callback: Fn()>(Callback);
+
+impl<F, S> RawTask<F, S>
+where
+    F: Future<Output = ()>,
+{
+    fn poll(&self) {
+        unsafe {
+            let mut cx = Context::from_waker(Waker::noop());
+            let res = F::poll(Pin::new_unchecked(&mut *self.future), &mut cx);
+            println!("{res:?}");
+        };
+    }
+}
+
+fn spawn<F>(fut: F)
+where
+    F: Future<Output = ()>,
+{
+    // let boxed = Box::into_raw(Box::new(fut));
+    // let boxed = Box::pin(fut);
+    // let mut schedule = Schedule(|| println!("callback!"));
+    let mut schedule = || println!("callback!");
+    let raw = RawTask {
+        schedule: &raw mut schedule,
+        future: &mut Box::pin(fut),
+    };
+    unsafe {
+        raw.poll();
+        (*raw.schedule)();
+        let p = Box::into_raw(Box::new(raw)) as *const ();
+    };
+    // let alloc = Box::into_raw(Box::new(raw));
+    // let task = Task {
+    //     raw: alloc as *const (),
+    // };
+    // let task = Task { future: boxed };
+}
+
+fn main() {
+    let a = 1;
+    let b = &a;
+    spawn(async {
+        let c = b;
+    });
+}

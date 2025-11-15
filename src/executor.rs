@@ -8,7 +8,7 @@ use std::{
         atomic::AtomicUsize,
         mpsc::{Receiver, Sender, channel},
     },
-    task::{Context, Poll, Waker},
+    task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
 
 thread_local! {
@@ -32,17 +32,23 @@ impl<'a> LocalExecutor<'a> {
     where
         F: Future<Output = O> + 'a,
     {
-        let future = Box::pin(fut);
-        let raw = RawTask::allocate(future);
-        let task = Task { raw };
-        QUEUE.with(|(tx, _)| tx.send(task).unwrap());
+        QUEUE.with(|(tx, _)| {
+            let future = Box::pin(fut);
+            let schedule = |task| {
+                println!("schedule me!");
+                tx.send(task).unwrap();
+            };
+            let raw = RawTask::allocate(future, schedule);
+            let task = Task { raw };
+            println!("send task");
+            tx.send(task).unwrap();
+        });
     }
 
     fn run(&self) {
         QUEUE.with(|(_, rx)| {
             while let Ok(task) = rx.recv() {
                 task.poll();
-                break;
             }
         });
     }
@@ -73,14 +79,15 @@ struct Header {
     vtable: &'static RawTaskVTable,
 }
 
-struct RawTask<F, O> {
+struct RawTask<F, O, S> {
     header: *mut Header,
     future: *mut F,
     output: *mut O,
+    schedule: *mut S,
 }
 
-impl<F, O> Copy for RawTask<F, O> {}
-impl<F, O> Clone for RawTask<F, O> {
+impl<F, O, S> Copy for RawTask<F, O, S> {}
+impl<F, O, S> Clone for RawTask<F, O, S> {
     fn clone(&self) -> Self {
         *self
     }
@@ -89,22 +96,35 @@ impl<F, O> Clone for RawTask<F, O> {
 struct RawTaskOffsets {
     future: usize,
     output: usize,
+    schedule: usize,
 }
 
-impl<F, O> RawTask<F, O>
+impl<F, O, S> RawTask<F, O, S>
 where
     F: Future<Output = O>,
+    S: Fn(Task),
 {
-    fn compute_layout() -> (Layout, RawTaskOffsets) {
+    fn layout() -> (Layout, RawTaskOffsets) {
         let lay_header = Layout::new::<Header>();
         let lay_f = Layout::new::<F>();
         let lay_o = Layout::new::<O>();
+        let lay_s = Layout::new::<S>();
 
         let layout = lay_header;
-        let (_, future) = layout.extend(lay_f).unwrap();
+        let (layout, future) = layout.extend(lay_f).unwrap();
         let (layout, output) = layout.extend(lay_o).unwrap();
+        let (layout, schedule) = layout.extend(lay_s).unwrap();
 
-        (layout, RawTaskOffsets { future, output })
+        // println!("{layout:?} {future} {output} {schedule}");
+
+        (
+            layout,
+            RawTaskOffsets {
+                future,
+                output,
+                schedule,
+            },
+        )
     }
 
     fn arrange(p: *const (), offset: &RawTaskOffsets) -> Self {
@@ -113,13 +133,14 @@ where
                 header: p as *mut Header,
                 future: p.byte_add(offset.future) as *mut F,
                 output: p.byte_add(offset.output) as *mut O,
+                schedule: p.byte_add(offset.schedule) as *mut S,
             }
         }
     }
 
-    fn allocate(future: F) -> *const () {
+    fn allocate(future: F, schedule: S) -> *const () {
         println!("allocate fut");
-        let (layout, offset) = Self::compute_layout();
+        let (layout, offset) = Self::layout();
 
         unsafe {
             let p = std::alloc::alloc(layout) as *const ();
@@ -127,13 +148,15 @@ where
 
             println!("write header");
             raw.header.write(Header {
-                state: AtomicUsize::new(0),
+                state: AtomicUsize::new(54),
                 vtable: &RawTaskVTable { poll: Self::poll },
             });
 
-            raw.future.write(future);
             println!("write future");
-            // (raw.byte_add(offset.future) as *mut F).write(future);
+            raw.future.write(future);
+
+            println!("write callback");
+            raw.schedule.write(schedule);
 
             println!("ret");
             p
@@ -141,15 +164,45 @@ where
     }
 
     fn from_ptr(p: *const ()) -> Self {
-        let (_, offset) = Self::compute_layout();
+        // println!("from_ptr");
+        let (_, offset) = Self::layout();
         Self::arrange(p, &offset)
     }
 
+    fn test(p: *const ()) {
+        unsafe {
+            let header = p as *const Header;
+            let state = &(*header).state;
+            println!("state = {state:?}");
+
+            let header = p as *const Header;
+            let this = p as *const Self;
+            println!("header = {} this = {}", header as usize, this as usize);
+            // let state = &(*(*p.cast::<Self>()).header).state;
+            // println!("state = {state:?}");
+
+            // let s = this.byte_add(30) as *const S;
+            // let task = Task { raw: p, id: 32 };
+            // (*s)(task);
+
+            println!("schedule = {:#x}", (*p.cast::<Self>()).schedule as usize);
+            let raw = Self::from_ptr(p);
+            println!("schedule = {:#x}", raw.schedule as usize);
+            let task = Task { raw: p };
+            (*raw.schedule)(task);
+            // raw.schedule.read()(task);
+            // let task = Task { raw: p, id: 32 };
+            // (*raw.schedule)(task);
+        }
+    }
+
     fn poll(p: *const ()) {
+        // Self::test(p);
         println!("polling!");
         let raw = Self::from_ptr(p);
         unsafe {
-            let waker = Waker::noop();
+            // let waker = Waker::noop();
+            let waker = Waker::from_raw(RawWaker::new(p, &Self::RAW_WAKER_VTABLE));
             let mut cx = Context::from_waker(&waker);
 
             match F::poll(Pin::new_unchecked(&mut *raw.future), &mut cx) {
@@ -157,6 +210,35 @@ where
                 Poll::Pending => {}
             }
         };
+    }
+
+    const RAW_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+        Self::clone_waker,
+        Self::wake,
+        Self::wake_by_ref,
+        Self::drop_waker,
+    );
+
+    unsafe fn clone_waker(p: *const ()) -> RawWaker {
+        println!("waker clone");
+        todo!()
+    }
+
+    unsafe fn wake(p: *const ()) {
+        println!("waker wake");
+    }
+
+    unsafe fn wake_by_ref(p: *const ()) {
+        println!("waker wake_by_ref");
+        unsafe {
+            let this = Self::from_ptr(p);
+            let task = Task { raw: p };
+            (*this.schedule)(task);
+        }
+    }
+
+    unsafe fn drop_waker(p: *const ()) {
+        println!("waker drop")
     }
 }
 
@@ -170,6 +252,7 @@ pub fn works() {
         let c = b;
         println!("increment &mut a");
         *c += 1;
+        yield_now().await;
     });
 
     exec.run();
