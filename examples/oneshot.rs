@@ -1,8 +1,9 @@
+#![allow(unused)]
 use std::{
     cell::UnsafeCell,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
     },
     thread,
 };

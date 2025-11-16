@@ -17,24 +17,25 @@ use std::{
 };
 
 use acom::{DropGuard, executor, parallel::Parallel};
+use tracing::{debug, trace};
 
 fn g<F: Future>(fut: F) {
     dbg!(std::mem::size_of::<F>());
 }
 
 fn drop_guard() {
-    println!("top");
+    trace!("top");
     let mut n = &mut 1;
     {
-        println!("begin_scope");
+        trace!("begin_scope");
         DropGuard(|| *n += 1);
-        println!("end_scope");
+        trace!("end_scope");
     }
-    println!("{n}");
-    println!("bottom");
+    trace!("{n}");
+    trace!("bottom");
 }
 
 fn main() {
-    executor::works();
-    // executor::test();
+    acom::setup_logging();
+    executor::test();
 }
