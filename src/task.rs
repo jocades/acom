@@ -1,21 +1,24 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use std::{
-    alloc::Layout,
+    alloc::{Layout, alloc, dealloc, handle_alloc_error},
     cell::UnsafeCell,
-    mem::ManuallyDrop,
     pin::Pin,
-    sync::atomic::{AtomicUsize, Ordering},
+    process::abort,
+    sync::atomic::{
+        AtomicUsize,
+        Ordering::{Acquire, Relaxed, Release},
+    },
     task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
 };
 
-use tracing::{debug, trace};
+use tracing::{debug, instrument, trace};
 
 // Bit masks:
 //
 // ```txt
-// [ usize_max..8 ]    [ bit 2 ]    [ bit 1 ]
-//    ref_count         running     scheduled
+// [ usize_max..=8 ]    [ 8..2 ]    [ bit 2 ]    [ bit 1 ]
+//     ref_count        reserved     running     scheduled
 // ```
 
 /// Set if the task is scheduled.
@@ -27,7 +30,7 @@ pub(crate) const SCHEDULED: usize = 0;
 
 /// Set if the task is **currently** being polled.
 ///
-/// A task is in the running state _only_ when it is being polled.
+/// A task is in the running state **only** when it is being polled.
 pub(crate) const RUNNING: usize = 1 << 1;
 
 /// Set if the task has completed.
@@ -37,6 +40,9 @@ pub(crate) const RUNNING: usize = 1 << 1;
 ///
 /// This flag **cannot** be set when the task is `scheduled` or `running`.
 pub(crate) const READY: usize = 1 << 2;
+
+/// The top bits reserved for counting how many wakers have been cloned.
+pub(crate) const REF_COUNT: usize = 1 << 8;
 
 #[derive(Debug)]
 pub struct Task {
@@ -72,14 +78,23 @@ impl Task {
 
 impl Drop for Task {
     fn drop(&mut self) {
-        trace!("drop task");
+        debug!("drop task");
+    }
+}
+
+pub trait Scheduler {
+    fn schedule(&self, task: Task);
+}
+
+impl<F: Fn(Task)> Scheduler for F {
+    fn schedule(&self, task: Task) {
+        self(task)
     }
 }
 
 struct RawTaskVTable {
     schedule: unsafe fn(*const ()),
     poll: unsafe fn(*const ()),
-    offsets: &'static RawTaskOffsets,
 }
 
 struct Header {
@@ -109,33 +124,38 @@ struct RawTaskOffsets {
     schedule: usize,
 }
 
+struct RawTaskLayout {
+    layout: Layout,
+    offset: RawTaskOffsets,
+}
+
 // For debugging purposes.
 static ALLOCATED: AtomicUsize = AtomicUsize::new(0);
-
-// Const fns do not allow panics or capturing references so printing the actual
-// `Display` of the error is not possible. This is a workaround.
-macro_rules! unwrap {
-    ($value:expr) => {{
-        match $value {
-            Ok(v) => v,
-            Err(_) => panic!("called `Result::unwrap()` on an `Err` value"),
-        }
-    }};
-}
 
 impl<F, O, S> RawTask<F, O, S> {
     const LAYOUT: (Layout, RawTaskOffsets) = Self::layout();
 
     const fn layout() -> (Layout, RawTaskOffsets) {
+        // Const fns do not allow calling non constant functions (`.unwrap()`)
+        // nor capturing references so displaying the error is not possible.
+        macro_rules! unwrap {
+            ($value:expr) => {{
+                match $value {
+                    Ok(v) => v,
+                    Err(_) => panic!("called `Result::unwrap()` on an `Err` value"),
+                }
+            }};
+        }
+
         let lay_header = Layout::new::<Header>();
-        let lay_f = Layout::new::<F>();
-        let lay_o = Layout::new::<O>();
-        let lay_s = Layout::new::<S>();
+        let lay_future = Layout::new::<F>();
+        let lay_output = Layout::new::<O>();
+        let lay_schedule = Layout::new::<S>();
 
         let layout = lay_header;
-        let (layout, future) = unwrap!(layout.extend(lay_f));
-        let (layout, output) = unwrap!(layout.extend(lay_o));
-        let (layout, schedule) = unwrap!(layout.extend(lay_s));
+        let (layout, future) = unwrap!(layout.extend(lay_future));
+        let (layout, output) = unwrap!(layout.extend(lay_output));
+        let (layout, schedule) = unwrap!(layout.extend(lay_schedule));
 
         (
             layout,
@@ -159,14 +179,16 @@ impl<F, O, S> RawTask<F, O, S> {
     }
 }
 
-pub trait Scheduler {
-    fn schedule(&self, task: Task);
+macro_rules! scheduler {
+    ($p:expr) => {
+        (*($p.byte_add(Self::LAYOUT.1.schedule) as *mut S))
+    };
 }
 
-impl<F: Fn(Task)> Scheduler for F {
-    fn schedule(&self, task: Task) {
-        self(task)
-    }
+macro_rules! future_mut {
+    ($p:expr) => {
+        (&mut *($p.byte_add(Self::LAYOUT.1.future) as *mut F))
+    };
 }
 
 impl<F, O, S> RawTask<F, O, S>
@@ -174,37 +196,9 @@ where
     F: Future<Output = O>,
     S: Scheduler,
 {
-    pub fn allocate(future: F, schedule: S) -> *const () {
-        let (layout, offset) = Self::LAYOUT;
-        unsafe {
-            let p = std::alloc::alloc(layout) as *const ();
-            let raw = Self::arrange(p);
-
-            raw.header.write(Header {
-                state: AtomicUsize::new(54),
-                waker: UnsafeCell::new(None),
-                vtable: &Self::VTABLE,
-            });
-
-            raw.future.write(future);
-
-            raw.schedule.write(schedule);
-
-            ALLOCATED.fetch_add(layout.size(), Ordering::Relaxed);
-            debug!(total = ?ALLOCATED, ?layout, ?offset, "allocate");
-
-            p
-        }
-    }
-
-    fn from_ptr(p: *const ()) -> Self {
-        Self::arrange(p)
-    }
-
     const VTABLE: RawTaskVTable = RawTaskVTable {
-        schedule: schedule::<S>,
+        schedule: Self::schedule,
         poll: Self::poll,
-        offsets: &Self::LAYOUT.1,
     };
 
     const RAW_WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
@@ -214,49 +208,97 @@ where
         Self::drop_waker,
     );
 
+    fn from_ptr(p: *const ()) -> Self {
+        Self::arrange(p)
+    }
+
+    pub fn allocate(future: F, schedule: S) -> *const () {
+        let (layout, offset) = Self::LAYOUT;
+        unsafe {
+            let p = alloc(layout) as *const ();
+            if p.is_null() {
+                handle_alloc_error(layout);
+            }
+
+            let this = Self::arrange(p);
+
+            this.header.write(Header {
+                state: AtomicUsize::new(SCHEDULED | REF_COUNT),
+                waker: UnsafeCell::new(None),
+                vtable: &Self::VTABLE,
+            });
+
+            this.future.write(future);
+
+            this.schedule.write(schedule);
+
+            ALLOCATED.fetch_add(layout.size(), Relaxed);
+            debug!(total = ?ALLOCATED, ?layout, ?offset, "allocate");
+
+            p
+        }
+    }
+
+    unsafe fn deallocate(p: *const ()) {
+        // Drop the schedule callback and what it may have captured.
+        let schedule = p.byte_add(Self::LAYOUT.1.schedule) as *mut S;
+        schedule.drop_in_place();
+
+        // Drop the task, the future allocated via `Box` will be deallocated
+        // in the executor when the task gets dropped.
+        dealloc(p as *mut u8, Self::LAYOUT.0);
+        ALLOCATED.fetch_sub(Self::LAYOUT.0.size(), Relaxed);
+    }
+
+    unsafe fn schedule(p: *const ()) {
+        trace!("schedule");
+        scheduler!(p).schedule(Task { raw: p });
+        // let scheduler = p.byte_add(Self::LAYOUT.1.schedule) as *mut S;
+        // (*(p.byte_add(Self::LAYOUT.1.schedule) as *mut S)).schedule(Task { raw: p });
+        // (*scheduler).schedule(Task { raw: p });
+    }
+
+    fn poll(p: *const ()) {
+        unsafe {
+            let waker = (*header!(p).waker.get())
+                .get_or_insert_with(|| Waker::from_raw(RawWaker::new(p, &Self::RAW_WAKER_VTABLE)));
+            let mut cx = Context::from_waker(&waker);
+
+            match F::poll(Pin::new_unchecked(future_mut!(p)), &mut cx) {
+                Poll::Ready(_) => {
+                    trace!("ready")
+                }
+                Poll::Pending => {
+                    trace!("pending")
+                }
+            }
+        };
+    }
+
     unsafe fn clone_waker(p: *const ()) -> RawWaker {
         trace!("waker clone");
-        todo!()
+        let state = header!(p).state.fetch_add(REF_COUNT, Relaxed);
+
+        if state > isize::MAX as usize {
+            panic!("state overflow");
+        }
+
+        RawWaker::new(p, &Self::RAW_WAKER_VTABLE)
     }
 
     unsafe fn wake(p: *const ()) {
-        trace!("waker wake");
+        let state = &header!(p).state.load(Acquire);
     }
 
     unsafe fn wake_by_ref(p: *const ()) {
         trace!("waker wake_by_ref");
-        trace!("RawTask::schedule");
-        // (*this.schedule)(task);
+        scheduler!(p).schedule(Task { raw: p });
     }
 
-    unsafe fn drop_waker(p: *const ()) {
-        trace!("waker drop")
-    }
-
-    fn poll(p: *const ()) {
-        trace!("polling!");
-        let raw = Self::from_ptr(p);
-        unsafe {
-            let waker =
-                ManuallyDrop::new(Waker::from_raw(RawWaker::new(p, &Self::RAW_WAKER_VTABLE)));
-            let mut cx = Context::from_waker(&waker);
-
-            match F::poll(Pin::new_unchecked(&mut *raw.future), &mut cx) {
-                Poll::Ready(_) => {}
-                Poll::Pending => {}
-            }
-        };
-    }
-}
-
-unsafe fn schedule<S: Scheduler>(p: *const ()) {
-    let header = &*(p as *const Header);
-    let scheduler = p.byte_add(header.vtable.offsets.schedule) as *mut S;
-    let task = Task { raw: p };
-    (*scheduler).schedule(task);
-    // header.vtable.offsets.schedule
-    // let raw = Self::from_ptr(p);
-    // let task = Task { raw: p };
-    trace!("RawTask::schedule");
-    // unsafe { (*raw.schedule)(task) };
+    /// Drops a waker.
+    ///
+    /// This function will decrement the reference count. If it drops down to zero, the associated
+    /// join handle has been dropped too, and the task has not been completed, then it will get
+    /// scheduled one more time so that its future gets dropped by the executor.
+    unsafe fn drop_waker(p: *const ()) {}
 }

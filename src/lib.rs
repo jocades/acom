@@ -1,4 +1,5 @@
 pub mod executor;
+pub mod future;
 pub mod kqueue;
 pub mod parallel;
 pub mod task;

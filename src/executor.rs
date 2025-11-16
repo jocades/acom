@@ -14,6 +14,8 @@ use tracing::{debug, info, instrument, trace};
 
 use crate::task::{RawTask, Task};
 
+// fn scheduler(task: Task) {}
+
 struct LocalExecutor<'a> {
     queue: Receiver<Task>,
     sender: Sender<Task>,
@@ -34,19 +36,21 @@ impl<'a> LocalExecutor<'a> {
 
     pub fn spawn<F, O>(&self, fut: F)
     where
-        F: Future<Output = O>,
+        F: Future<Output = O> + 'a,
     {
-        let future = Box::pin(fut);
         let tx = self.sender.clone();
-
-        let schedule = |task| {
+        let schedule = move |task| {
             trace!("schedule callback");
             tx.send(task).unwrap();
         };
 
-        // let schedule = |_| trace!("callback!");
-        let raw = RawTask::allocate(future, schedule);
-        let task = Task { raw };
+        let task = Task {
+            raw: if mem::size_of::<F>() > 2048 {
+                RawTask::allocate(Box::pin(fut), schedule)
+            } else {
+                RawTask::allocate(fut, schedule)
+            },
+        };
         task.schedule();
     }
 
@@ -66,53 +70,10 @@ pub fn test() {
     exec.spawn(async move {
         let c = b;
         debug!("increment &mut a");
-        yield_now().await;
+        *c += 1;
+        crate::future::yield_now().await;
     });
 
     exec.run();
     debug!("{a}");
-}
-
-macro_rules! pin {
-    ($x:ident) => {
-        let mut $x = core::pin::pin!($x);
-    };
-}
-
-pub fn spin_on<F: Future>(fut: F) -> F::Output {
-    let mut cx = Context::from_waker(Waker::noop());
-
-    pin!(fut);
-
-    loop {
-        match fut.as_mut().poll(&mut cx) {
-            Poll::Pending => {
-                trace!("pending");
-            }
-            Poll::Ready(v) => {
-                trace!("ready");
-                return v;
-            }
-        }
-    }
-}
-
-async fn yield_now() {
-    struct YieldNow(bool);
-
-    impl Future for YieldNow {
-        type Output = ();
-
-        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-            trace!("yield_now.poll()");
-            if !self.0 {
-                self.0 = true;
-                cx.waker().wake_by_ref();
-                return Poll::Pending;
-            }
-            Poll::Ready(())
-        }
-    }
-
-    YieldNow(false).await
 }

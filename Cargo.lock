@@ -7,6 +7,7 @@ name = "acom"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "pin-project-lite",
  "tracing",
  "tracing-subscriber",
 ]
