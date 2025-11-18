@@ -55,9 +55,8 @@ impl<T> Mutex<T> {
             .is_err()
         {
             while self.locked.load(Relaxed) == LOCKED {
-                thread::yield_now();
+                std::hint::spin_loop();
             }
-            thread::yield_now();
         }
         MutexGuard { lock: self }
     }

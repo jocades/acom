@@ -1,35 +1,34 @@
-#![allow(unused)]
-use std::{
-    marker::PhantomData,
-    mem,
-    pin::Pin,
-    sync::{
-        atomic::{AtomicUsize, Ordering},
-        mpsc::{Receiver, Sender, channel},
-    },
-    task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
+use std::cell::OnceCell;
+use std::marker::PhantomData;
+use std::mem;
+use std::pin::Pin;
+use std::sync::mpsc::{Receiver, Sender, channel};
+use std::task::{Context, Poll, Waker};
+
+use tracing::{debug, trace};
+
+use crate::{
+    reactor::Reactor,
+    task::{RawTask, Task},
 };
 
-use tracing::{debug, info, instrument, trace};
-
-use crate::task::{RawTask, Task};
-
-// fn scheduler(task: Task) {}
-
-struct LocalExecutor<'a> {
+struct Executor<'a> {
     queue: Receiver<Task>,
-    sender: Sender<Task>,
 
     // Invariant `'a` lifetime.
     _marker: PhantomData<&'a ()>,
 }
 
-impl<'a> LocalExecutor<'a> {
+thread_local! {
+    static SENDER: OnceCell<Sender<Task>> = OnceCell::new();
+}
+
+impl<'a> Executor<'a> {
     pub fn new() -> Self {
         let (sender, queue) = channel();
+        SENDER.with(move |s| s.set(sender).expect("already init"));
         Self {
             queue,
-            sender,
             _marker: PhantomData,
         }
     }
@@ -38,9 +37,54 @@ impl<'a> LocalExecutor<'a> {
     where
         F: Future<Output = O> + 'a,
     {
-        let tx = self.sender.clone();
+        trace!("spawn");
+        SENDER.with(|s| {
+            let tx = s.get().unwrap().clone();
+            let schedule = move |task| {
+                trace!("callback");
+                tx.send(task).unwrap();
+            };
+
+            let task = Task {
+                raw: if mem::size_of::<F>() > 2048 {
+                    RawTask::allocate(Box::pin(fut), schedule)
+                } else {
+                    RawTask::allocate(fut, schedule)
+                },
+            };
+
+            task.schedule();
+        });
+    }
+
+    fn run(&self) {
+        let mut events: [libc::kevent; Reactor::MAX_EVENTS] = unsafe { mem::zeroed() };
+
+        loop {
+            while let Ok(task) = self.queue.try_recv() {
+                task.poll();
+            }
+
+            debug!("wait for events");
+            let nev = Reactor::get().wait(&mut events);
+            for ev in &events[..nev] {
+                debug!(?ev);
+                let waker = unsafe { Box::from_raw(ev.udata as *mut Waker) };
+                waker.wake();
+            }
+        }
+    }
+}
+
+pub fn spawn<'a, F, O>(fut: F)
+where
+    F: Future<Output = O> + 'a,
+{
+    trace!("spawn");
+    SENDER.with(|s| {
+        let tx = s.get().unwrap().clone();
         let schedule = move |task| {
-            trace!("schedule callback");
+            trace!("callback");
             tx.send(task).unwrap();
         };
 
@@ -51,29 +95,52 @@ impl<'a> LocalExecutor<'a> {
                 RawTask::allocate(fut, schedule)
             },
         };
-        task.schedule();
-    }
 
-    fn run(&self) {
-        while let Ok(task) = self.queue.recv() {
-            task.poll();
-        }
-    }
+        task.schedule();
+    });
 }
 
-pub fn test() {
-    let exec = LocalExecutor::new();
+use std::time::Duration;
 
-    let mut a = 1;
-    let b = &mut a;
+pub fn test() {
+    let exec = Executor::new();
 
     exec.spawn(async move {
-        let c = b;
-        debug!("increment &mut a");
-        *c += 1;
-        crate::future::yield_now().await;
+        debug!("start");
+        spawn(sleep(Duration::from_secs(2)));
+        sleep(Duration::from_secs(1)).await;
+        debug!("end");
     });
 
     exec.run();
-    debug!("{a}");
+}
+
+/// Asynchronously sleep for the specified duration. Yields the current task
+/// and resumes it after the duration has elapsed.
+pub async fn sleep(dur: Duration) {
+    struct Sleep {
+        duration: Duration,
+        registered: bool,
+    }
+
+    impl Future for Sleep {
+        type Output = ();
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            if !self.registered {
+                Reactor::get()
+                    .wake_on_timer(self.duration, cx.waker().clone())
+                    .unwrap();
+                self.registered = true;
+                return Poll::Pending;
+            }
+            Poll::Ready(())
+        }
+    }
+
+    Sleep {
+        duration: dur,
+        registered: false,
+    }
+    .await;
 }

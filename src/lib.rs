@@ -1,7 +1,7 @@
 pub mod executor;
 pub mod future;
-pub mod kqueue;
 pub mod parallel;
+pub mod reactor;
 pub mod task;
 
 pub struct DropGuard<F: FnMut()>(pub F);
