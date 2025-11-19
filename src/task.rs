@@ -1,19 +1,13 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use std::{
-    alloc::{Layout, alloc, dealloc, handle_alloc_error},
-    cell::UnsafeCell,
-    mem::ManuallyDrop,
-    pin::Pin,
-    process::abort,
-    sync::atomic::{
-        AtomicUsize,
-        Ordering::{AcqRel, Acquire, Relaxed, Release},
-    },
-    task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
-};
+use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
+use std::cell::UnsafeCell;
+use std::pin::Pin;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
+use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
-use tracing::{debug, instrument, trace};
+use tracing::{debug, trace};
 
 // Bit masks:
 //
@@ -277,12 +271,12 @@ where
     }
 
     unsafe fn schedule(p: *const ()) {
-        trace!("schedule");
+        trace!(?p, "schedule");
         scheduler!(p).schedule(Task { raw: p });
     }
 
     unsafe fn clone_waker(p: *const ()) -> RawWaker {
-        trace!("waker clone");
+        trace!(?p, "clone_wwaker");
         let state = header!(p).state.fetch_add(REF_COUNT, Relaxed);
         dbg_state(state + REF_COUNT);
         assert!(state < isize::MAX as usize);
@@ -295,7 +289,7 @@ where
     /// join handle has been dropped too, and the task has not been completed, then it will get
     /// scheduled one more time so that its future gets dropped by the executor.
     unsafe fn drop_waker(p: *const ()) {
-        debug!("drop_waker");
+        debug!(?p, "drop_waker");
         let header = &header!(p);
         let state = header.state.fetch_sub(REF_COUNT, AcqRel) - REF_COUNT;
 
@@ -364,6 +358,7 @@ where
     }
 
     unsafe fn drop_task(p: *const ()) {
+        trace!(?p, "drop_task");
         let state = header!(p).state.fetch_sub(REF_COUNT, AcqRel) - REF_COUNT;
         if (state >> REF_PAD) == 0 && state & HANDLE == 0 {
             Self::deallocate(p);

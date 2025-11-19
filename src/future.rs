@@ -50,14 +50,18 @@ pub async fn join<F1: Future, F2: Future>(f1: F1, f2: F2) -> (F1::Output, F2::Ou
             let mut this = self.project();
 
             if let Some(f1) = this.f1.as_mut().as_pin_mut() {
+                println!("poll f1");
                 if let Poll::Ready(o1) = f1.poll(cx) {
+                    println!("ready f1");
                     *this.o1 = Some(o1);
                     this.f1.set(None);
                 }
             }
 
             if let Some(f2) = this.f2.as_mut().as_pin_mut() {
+                println!("poll f2");
                 if let Poll::Ready(o2) = f2.poll(cx) {
+                    println!("ready f2");
                     *this.o2 = Some(o2);
                     this.f2.set(None);
                 }

@@ -4,6 +4,8 @@ pub mod parallel;
 pub mod reactor;
 pub mod task;
 
+pub use executor::{Executor, sleep, spawn};
+
 pub struct DropGuard<F: FnMut()>(pub F);
 
 impl<F: FnMut()> Drop for DropGuard<F> {

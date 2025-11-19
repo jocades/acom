@@ -1,19 +1,15 @@
-#![allow(unused_unsafe)]
+use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::ptr::{null, null_mut};
+use std::sync::OnceLock;
+use std::task::Waker;
+use std::time::Duration;
 
 use libc as c;
-use std::{
-    cell::LazyCell,
-    io,
-    mem::zeroed,
-    os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
-    ptr::{null, null_mut},
-    sync::{LazyLock, OnceLock},
-    task::Waker,
-    time::Duration,
-};
 
 macro_rules! sc {
     ($fn:ident$args:tt) => {{
+        #[allow(unused_unsafe)] // Discard warnings on nested unsafe blocks.
         let r = unsafe { libc::$fn$args };
         if r < 0 { Err(std::io::Error::last_os_error()) } else { Ok(r) }
     }};

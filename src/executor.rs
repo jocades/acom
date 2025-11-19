@@ -12,7 +12,7 @@ use crate::{
     task::{RawTask, Task},
 };
 
-struct Executor<'a> {
+pub struct Executor<'a> {
     queue: Receiver<Task>,
 
     // Invariant `'a` lifetime.
@@ -33,31 +33,7 @@ impl<'a> Executor<'a> {
         }
     }
 
-    pub fn spawn<F, O>(&self, fut: F)
-    where
-        F: Future<Output = O> + 'a,
-    {
-        trace!("spawn");
-        SENDER.with(|s| {
-            let tx = s.get().unwrap().clone();
-            let schedule = move |task| {
-                trace!("callback");
-                tx.send(task).unwrap();
-            };
-
-            let task = Task {
-                raw: if mem::size_of::<F>() > 2048 {
-                    RawTask::allocate(Box::pin(fut), schedule)
-                } else {
-                    RawTask::allocate(fut, schedule)
-                },
-            };
-
-            task.schedule();
-        });
-    }
-
-    fn run(&self) {
+    pub fn run(&self) {
         let mut events: [libc::kevent; Reactor::MAX_EVENTS] = unsafe { mem::zeroed() };
 
         loop {
@@ -100,26 +76,14 @@ where
     });
 }
 
-use std::time::Duration;
-
-pub fn test() {
-    let exec = Executor::new();
-
-    exec.spawn(async move {
-        debug!("start");
-        spawn(sleep(Duration::from_secs(2)));
-        sleep(Duration::from_secs(1)).await;
-        debug!("end");
-    });
-
-    exec.run();
-}
+use std::time::{Duration, Instant};
 
 /// Asynchronously sleep for the specified duration. Yields the current task
 /// and resumes it after the duration has elapsed.
 pub async fn sleep(dur: Duration) {
     struct Sleep {
         duration: Duration,
+        when: Instant,
         registered: bool,
     }
 
@@ -127,19 +91,24 @@ pub async fn sleep(dur: Duration) {
         type Output = ();
 
         fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            if Instant::now() >= self.when {
+                return Poll::Ready(());
+            }
+
             if !self.registered {
                 Reactor::get()
                     .wake_on_timer(self.duration, cx.waker().clone())
                     .unwrap();
                 self.registered = true;
-                return Poll::Pending;
             }
-            Poll::Ready(())
+
+            Poll::Pending
         }
     }
 
     Sleep {
         duration: dur,
+        when: Instant::now() + dur,
         registered: false,
     }
     .await;
